@@ -9,6 +9,10 @@
 #include<cstdint>
 #include<string>
 #include<algorithm>
+#include<cmath>
+#include<cstring>
+#include <random>
+#include <chrono>
 
 struct Config //Llama2.c导出的二进制文件头部的28个字节是配置参数
 {
@@ -39,7 +43,7 @@ struct TransformerWeights //网络权重
 struct RunState
 {
     // vector相比new[]可以自己释放，性能上也差不多
-    std::vector<float> x; //各个变量的解释见allocate
+    std::vector<float> x; //各个变量的解释见allocate和forward
     std::vector<float> xb; 
     std::vector<float> xb2; 
     std::vector<float> hb; 
@@ -60,7 +64,7 @@ struct RunState
     {
         const int kv_dim = p.dim / p.n_q_heads * p.n_kv_heads ;
 
-        x.assign(static_cast<size_t>(p.dim), 0.0f); //TODO:这些维度怎么来的？
+        x.assign(static_cast<size_t>(p.dim), 0.0f); //这些维度详见forward
         xb.assign(static_cast<size_t>(p.dim), 0.0f);
         xb2.assign(static_cast<size_t>(p.dim), 0.0f);
 
@@ -72,7 +76,7 @@ struct RunState
         key_cache.assign(static_cast<size_t>(p.n_layers) * p.seq_len * kv_dim, 0.0f); //每层每个位置缓存kv_dim维key
         value_cache.assign(static_cast<size_t>(p.n_layers) * p.seq_len * kv_dim, 0.0f); //每层每个位置缓存kv_dim维value
 
-        att.assign(static_cast<size_t>(p.n_q_heads) * p.seq_len, 0.0f); //每个query head对历史seq_len个位置的attention分数
+        att.assign(static_cast<size_t>(p.n_q_heads) * p.seq_len, 0.0f); //当前pos在当前q_head上对前面位置（最大为seq_len）的attention分数
 
         logits.assign(p.vocab_size, 0.0f); //输出词表上每个token的未归一化分数
     }
@@ -143,7 +147,7 @@ void assign_weights(TransformerWeights &weights,float* weights_ptr,const Config 
     weights_ptr += rope_table_size;
     weights_ptr += rope_table_size;
 
-    weights.wcls = weights.token_embedding_table;// TODO:源码好像用的是share部分
+    weights.wcls = shared_weights ? weights.token_embedding_table : weights_ptr; //用来把(dim,)转回(vocab_size,) 
 
 }
 
@@ -164,7 +168,7 @@ struct Tokenizer
     std::vector<TokenIndex> sorted_vocab; //按照字符串排序，encode阶段能快速根据字符串找到token id
 
     int vocab_size = 0; //词表大小
-    std::uint32_t max_token_length = 0; //词表中最长token字符串长度TODO:
+    std::uint32_t max_token_length = 0; //词表中最长token字符串长度
 
     std::array<unsigned char, 512> byte_pieces{}; //储存256个单字节字符串，每个字符串占2个字节，例如'A'后面接一个'\0'
 };
@@ -177,14 +181,14 @@ void build_tokenizer(Tokenizer& tokenizer, const std::string& tokenizer_path, in
     tokenizer.sorted_vocab.clear();
     tokenizer.vocab_size = vocab_size;
 
-    for (int i = 0; i < 256; i++) {
-        tokenizer.byte_pieces[i * 2] = static_cast<unsigned char>(i);
-        tokenizer.byte_pieces[i * 2 + 1] = '\0';
+    for(int i=0;i<256;i++) 
+    {
+        tokenizer.byte_pieces[i] = static_cast<unsigned char>(i);
     }
 
     //读文件
     std::ifstream file(tokenizer_path, std::ios::binary);
-    if (!file) 
+    if(!file) 
     {
         throw std::runtime_error("couldn't load " + tokenizer_path);
     }
@@ -224,6 +228,10 @@ struct ProbIndex // top-p采样时用
 {
     float prob; //token的概率
     int index; //token的id
+    friend bool operator <(const ProbIndex &a,const ProbIndex &b)
+    {
+        return a.prob>b.prob;
+    }
 }; 
 
 struct Sampler //采样器，把模型输出的logits转换成下一个token
@@ -240,7 +248,7 @@ struct Sampler //采样器，把模型输出的logits转换成下一个token
     } 
 };
 
-void matmul(float* xout,const float* x,const float* w,int n,int d) // W(d,n)矩阵乘法x(n,)得到的结果存到xout (d,)
+void matmul(float* xout,const float* x,const float* w,int n,int d) // 输出、输入、权重、输入维度、输出维度。W(d,n)矩阵乘法x(n,)得到的结果存到xout (d,)。
 {
     #pragma omp parallel for //并行计算i
     for(int i=0;i<d;++i) 
@@ -400,8 +408,421 @@ std::vector<int> encode(Tokenizer& tokenizer,const std::string& text,bool bos,bo
 
     return tokens;
 }
+void rmsnorm(float* out,const float* x,const float* weight,int size)
+{
+    float ss=0.0f;
+
+    for(int j=0;j<size;++j) 
+    {
+        ss+=x[j]*x[j];
+    }
+
+    ss/=static_cast<float>(size);
+    ss+=1e-5f;
+    ss=1.0f/std::sqrt(ss);
+
+    for(int j=0;j<size;++j) 
+    {
+        out[j]=weight[j]*(ss*x[j]);
+    }
+}
+
+void softmax(float* x,int size)
+{
+    float max_val=x[0];
+
+    for(int i=1;i<size;++i) 
+    {
+        if(x[i]>max_val) 
+        {
+            max_val=x[i];
+        }
+    }
+
+    float sum=0.0f;
+
+    for(int i=0;i<size;++i) 
+    {
+        x[i]=std::exp(x[i]-max_val);
+        sum+=x[i];
+    }
+
+    for(int i=0;i<size;++i) 
+    {
+        x[i]/=sum;
+    }
+}
+float* forward(Transformer& transformer,int token,int pos)
+{
+    Config& p=transformer.config;
+    TransformerWeights& w=transformer.weights;
+    RunState& s=transformer.state;
+
+    const int dim=p.dim;
+    const int hidden_dim=p.hidden_dim;
+    const int head_size=dim/p.n_q_heads; //一个头的qkv有多少维度
+    const int kv_dim=p.n_kv_heads*head_size; //k和v总共的维度
+    const int kv_mul=p.n_q_heads/p.n_kv_heads; //一个q配多少个kv
+
+    if(token<0||token>=p.vocab_size) 
+    {
+        throw std::runtime_error("token id out of range");
+    }
+
+    if(pos<0||pos>=p.seq_len) 
+    {
+        throw std::runtime_error("position out of range");
+    }
+
+    float* x=s.x.data();
+
+    const float* content_row=w.token_embedding_table+static_cast<size_t>(token)*dim; //找到这个token在词表中对应的向量
+    std::memcpy(x,content_row,static_cast<size_t>(dim)*sizeof(float));
+
+    for(int l=0;l<p.n_layers;++l) //forward所有的layers
+    {
+
+        //Attention部分
+
+        //xb=RMSNorm(x)
+        rmsnorm(s.xb.data(),x,w.rms_att_weight+l*dim,dim);
+        
+        const size_t layer_offset=l*static_cast<size_t>(p.seq_len)*kv_dim; //当前层在KV cache中的偏移
+
+        float* key=s.key_cache.data()     + layer_offset + static_cast<size_t>(pos) * kv_dim; //当前token的key/value写入KV cache的位置
+        float* value=s.value_cache.data() + layer_offset + static_cast<size_t>(pos) * kv_dim;
+
+        
+        matmul(s.q.data(),s.xb.data(),w.Wq+l*static_cast<size_t>(dim)*dim,dim,dim); //q = Wq @ xb
+        matmul(key,s.xb.data(),w.Wk+l*static_cast<size_t>(dim)*kv_dim,dim,kv_dim); //key = Wk @ xb
+        matmul(value,s.xb.data(),w.Wv+l*static_cast<size_t>(dim)*kv_dim,dim,kv_dim); //value = Wv @ xb
+
+        for(int i=0;i<dim;i+=2) //RoPE
+        {
+            int head_dim=i%head_size; //多头注意力分别处理
+            float freq=1.0f/std::pow(10000.0f,head_dim/static_cast<float>(head_size)); //TODO:可不可以提前算出来存着？
+
+            float val=pos * freq;
+            float fcr=std::cos(val);
+            float fci=std::sin(val);
+
+            //kv_dim小于q_dim,所以i<kv_dim时q和k都旋转；否则只旋转q
+            int rotn=(i<kv_dim)?2:1;
+
+            for (int v_idx=0;v_idx<rotn;++v_idx) 
+            {
+                float* vec=(v_idx==0)?s.q.data():key; //v_idx为0的时候旋转q，为1的时候旋转k
+
+                float v0=vec[i];
+                float v1=vec[i + 1];
+
+                vec[i]     = v0 * fcr - v1 * fci; //旋转
+                vec[i + 1] = v0 * fci + v1 * fcr;
+            }
+        }
+
+        
+        #pragma omp parallel for
+        for(int h=0;h<p.n_q_heads;++h) //多头注意力,多个头配一个kv
+        {
+            float* q=s.q.data()+static_cast<size_t>(h)*head_size;
+            float* att=s.att.data()+static_cast<size_t>(h)*p.seq_len;
+
+            for(int t=0;t<=pos;++t) //计算当前head对0..pos的attention scores 
+            {
+                const float* k = s.key_cache.data() + layer_offset + static_cast<size_t>(t) * kv_dim + static_cast<size_t>(h / kv_mul) * head_size;
+
+                float score=0.0f;
+
+                for(int i=0;i<head_size;++i) 
+                {
+                    score+=q[i]*k[i];
+                }
+
+                score/=std::sqrt(static_cast<float>(head_size));
+                att[t]=score;
+            }
+
+            softmax(att,pos+1); //计算softmax
+
+            float* xb=s.xb.data()+static_cast<size_t>(h)*head_size; //加权求和value，结果写入xb对应head的位置
+
+            std::memset(xb,0,static_cast<size_t>(head_size)*sizeof(float));
+
+            for(int t=0;t<=pos;++t) 
+            {
+                const float* v = s.value_cache.data() + layer_offset + static_cast<size_t>(t) * kv_dim + static_cast<size_t>(h / kv_mul) * head_size;
+
+                float a=att[t];
+
+                for(int i=0;i<head_size;++i) 
+                {
+                    xb[i]+=a*v[i];
+                }
+            }
+        }
+
+        
+        matmul(s.xb2.data(),s.xb.data(),w.Wo+ l * static_cast<size_t>(dim) * dim,dim,dim); //xb2 = Wo @ xb
+
+        
+        for(int i=0;i<dim;++i) //x = x + xb2
+        {
+            x[i]+=s.xb2[i];
+        }
 
 
+        //FFN 部分
+
+        rmsnorm(s.xb.data(),x,w.rms_ffn_weight + l * dim,dim); //xb=RMSNorm(x)
+
+        matmul(s.hb.data(),s.xb.data(),w.W1 + l * static_cast<size_t>(dim) * hidden_dim,dim,hidden_dim); //hb = W1 @ xb
+        matmul(s.hb2.data(),s.xb.data(),w.W3 + l * static_cast<size_t>(dim) * hidden_dim,dim,hidden_dim); //hb2 = W3 @ xb
+
+        
+        for(int i=0;i<hidden_dim;++i) //hb = SiLU(hb) * hb2
+        {
+            float val=s.hb[i];
+            
+            val *= 1.0f / (1.0f + std::exp(-val)); //SiLU(x)=x*sigmoid(x)
+            val *= s.hb2[i]; //SwiGLU gate
+
+            s.hb[i]=val;
+        }
+
+        
+        matmul(s.xb.data(),s.hb.data(),w.W2 + l * static_cast<size_t>(dim) * hidden_dim,hidden_dim,dim); //xb = W2 @ hb
+
+        for(int i=0;i<dim;++i) //x = x + xb
+        {
+            x[i]+=s.xb[i];
+        }
+    }
+
+    rmsnorm(x,x,w.rms_final_weight,dim); //final RMSNorm，此时维度为(dim,)
+
+    matmul(s.logits.data(),x,w.wcls,dim,p.vocab_size); //logits = wcls @ x
+
+    return s.logits.data();
+}
+
+int sample_argmax(const float* probabilities,int n)
+{
+    int max_i=0;
+    float max_p=probabilities[0];
+
+    for(int i=1;i<n;++i) 
+    {
+        if(probabilities[i]>max_p) 
+        {
+            max_i=i;
+            max_p=probabilities[i];
+        }
+    }
+
+    return max_i;
+}
+
+int sample_mult(const float* probabilities,int n,float coin)
+{
+    float cdf=0.0f;
+
+    for(int i=0;i<n;++i) 
+    {
+        cdf+=probabilities[i];
+
+        if(coin<cdf) //cdf超过coin就采样
+        {
+            return i;
+        }
+    }
+
+    return n-1; //兜底
+}
+
+int sample_topp(const float* probabilities,int n,float topp,std::vector<ProbIndex>& probindex,float coin)
+{
+    probindex.clear();
+
+    const float cutoff=(1.0f-topp)/static_cast<float>(n-1); //没选上的部分(最多n-1个)的概率和不超过1-topp，概率值比cutoff小的不可能成为结果
+
+    for(int i=0;i<n;++i) 
+    {
+        if(probabilities[i]>=cutoff) //筛掉概率值比cutoff小的
+        {
+            probindex.push_back(ProbIndex{probabilities[i],i});
+        }
+    }
+
+    std::sort(probindex.begin(),probindex.end());
+
+    float cumulative_prob=0.0f;
+    int last_idx=static_cast<int>(probindex.size())-1;
+
+    for(int i=0;i<static_cast<int>(probindex.size());++i) 
+    {
+        cumulative_prob+=probindex[i].prob;
+
+        if(cumulative_prob>topp) //先筛选出概率和超过topp的部分
+        {
+            last_idx=i;
+            break;
+        }
+    }
+
+    float r=coin*cumulative_prob;
+    float cdf=0.0f;
+
+    for(int i=0;i<=last_idx;++i) 
+    {
+        cdf+=probindex[i].prob;
+
+        if(r<cdf) //cdf超过coin*cumulative_prob就采样
+        {
+            return probindex[i].index;
+        }
+    }
+
+    return probindex[last_idx].index; //兜底
+}
+
+int sample(Sampler& sampler,float* logits)
+{
+    static std::mt19937 rng(sampler.rng_state);
+    static std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+
+    if(sampler.vocab_size<=0) 
+    {
+        throw std::runtime_error("invalid sampler.vocab_size");
+    }
+
+    int next=0;
+
+    if(sampler.temperature == 0.0f) //直接取最大logits的token
+    {
+        next=sample_argmax(logits,sampler.vocab_size);
+    } 
+    else 
+    {
+        
+        for(int q=0;q<sampler.vocab_size;++q) //temperature scaling
+        {
+            logits[q]/=sampler.temperature;
+        }
+
+        
+        softmax(logits,sampler.vocab_size); //从logits到probabilities
+
+        
+        float coin=dist(rng); //随机数，用于从概率分布中抽样
+
+        if(sampler.topp<=0.0f||sampler.topp>=1.0f) //不启用top-p，直接从完整概率分布中采样
+        {
+            next=sample_mult(logits,sampler.vocab_size,coin);
+        } 
+        else //启用top-p采样
+        {
+            next=sample_topp(logits,sampler.vocab_size,sampler.topp,sampler.probindex,coin);
+        }
+    }
+
+    return next;
+}
+int hex_value(char c) //十六进制转十进制
+{
+    if('0'<=c&&c<='9') 
+    {
+        return c-'0';
+    }
+
+    if('a'<=c&&c<='f') 
+    {
+        return c - 'a' + 10;
+    }
+
+    if('A'<=c&&c<='F') 
+    {
+        return c-'A'+10;
+    }
+
+    return -1;
+}
+
+bool parse_byte_token(std::string_view piece,unsigned char& byte_val)
+{
+    if(piece.size()!=6) //形如"<0xAB>"，算上尖括号，长度为 6
+    {
+        return false;
+    }
+
+    if(piece[0]!='<'||piece[1]!='0'||piece[2]!='x'||piece[5]!='>') 
+    {
+        return false;
+    }
+
+    int hi=hex_value(piece[3]);
+    int lo=hex_value(piece[4]);
+
+    if(hi==-1||lo==-1) 
+    {
+        return false;
+    }
+
+    byte_val = static_cast<unsigned char>((hi<<4)|lo); //<<4就是乘以16
+    return true;
+}
+std::string_view decode(Tokenizer& tokenizer,int prev_token,int token)
+{
+    if(token<0||token>=tokenizer.vocab_size) 
+    {
+        throw std::runtime_error("decode: token id out of range");
+    }
+
+    std::string_view piece=tokenizer.vocab[token];
+
+    if(prev_token==1&&!piece.empty()&&piece.front()==' ') //如果当前piece紧跟BOS，并且开头是空格，则去掉这个空格
+    {
+        piece.remove_prefix(1);
+    }
+
+    //encode的时候会有词表中找不到，然后按照字节编码的情况。decode的时候要考虑这种。
+    unsigned char byte_val = 0;
+    if(parse_byte_token(piece,byte_val)) 
+    {
+        const char* byte_piece=reinterpret_cast<const char*>(tokenizer.byte_pieces.data() + static_cast<size_t>(byte_val));
+        
+        return std::string_view(byte_piece,1); //返回长度为1的string_view
+    }
+
+    return piece;
+}
+
+void safe_printf(std::string_view piece)
+{
+    if(piece.empty()) 
+    {
+        return;
+    }
+
+    if(piece.size()==1) 
+    {
+        unsigned char byte_val=static_cast<unsigned char>(piece[0]);
+
+        if((!std::isprint(byte_val)) && (!std::isspace(byte_val))) //检查是否可打印/是否是空白字符
+        {
+            return;
+        }
+    }
+
+    std::cout.write(piece.data(),static_cast<std::streamsize>(piece.size()));
+}
+
+long time_in_ms()
+{
+    using namespace std::chrono;
+
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
 
 void generate(Transformer &transformer,Tokenizer &tokenizer,Sampler &sampler,const std::string &prompt,int steps)
 {
@@ -410,6 +831,63 @@ void generate(Transformer &transformer,Tokenizer &tokenizer,Sampler &sampler,con
     for(auto token : prompt_tokens)
     {
         printf("token : %d\n",token);
+    }
+
+    if (prompt_tokens.empty()) 
+    {
+        throw std::runtime_error("expected at least one prompt token");
+    }
+
+
+    long start=0; //开始时间
+    int next=0; //下一个token
+    int token=prompt_tokens[0]; //当前token
+    int pos=0;
+
+    
+    while(pos<steps) //自回归生成循环
+    {
+        //当前token进入Transformer，得到下一token的logits
+        float* logits=forward(transformer,token,pos);
+
+        if(pos<static_cast<int>(prompt_tokens.size())-1) //已有的部分也要forward，处理KV cache
+        {
+            next=prompt_tokens[pos + 1];
+        } 
+        else 
+        {
+            next=sample(sampler, logits); //从logits里采样
+        }
+
+        ++pos;
+
+        
+        if(next==2 || next==1) //使用EOS token=2作为终止条件
+        {
+            break;
+        }
+
+        std::string_view piece=decode(tokenizer,token,next); //解码并打印当前生成出来的 token
+        safe_printf(piece);
+        std::fflush(stdout);
+
+        token=next; //自回归，这一步生成的token成为下一步输入
+
+        //第一轮开始计时
+        if(start==0) 
+        {
+            start=time_in_ms();
+        }
+    }
+
+    std::printf("\n");
+
+    
+    if(pos>1&&start!=0) //输出 tok/s
+    {
+        long end=time_in_ms();
+        double tok_per_sec=(pos-1)/static_cast<double>(end-start)*1000.0;
+        std::fprintf(stderr,"achieved tok/s: %f\n", tok_per_sec);
     }
 }
 
@@ -467,7 +945,7 @@ int main()
     Tokenizer tokenizer;
     build_tokenizer(tokenizer,"tokenizer.bin",transformer.config.vocab_size);
     
-    Sampler sampler(transformer.config.vocab_size,0.95,0.9,233333); //构造采样器
+    Sampler sampler(transformer.config.vocab_size,0.95,0.9,233333);
 
     generate(transformer,tokenizer,sampler,"Long long ago",transformer.config.seq_len);
 
