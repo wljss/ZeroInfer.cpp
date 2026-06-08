@@ -84,12 +84,12 @@ struct RunState
 
 struct Transformer
 {
-    Config config;
-    TransformerWeights weights;
-    RunState state;
-    int fd; //checkpoint文件的文件描述符
-    float* data; //指向checkpoint文件映射到内存的起点
-    ssize_t file_size; //checkpoint文件字节大小
+    Config config{};
+    TransformerWeights weights{};
+    RunState state{};
+    int fd=-1; //checkpoint文件的文件描述符
+    float* data=nullptr; //指向checkpoint文件映射到内存的起点
+    ssize_t file_size=0; //checkpoint文件字节大小
 
     ~Transformer() 
     {
@@ -170,7 +170,7 @@ struct Tokenizer
     int vocab_size = 0; //词表大小
     std::uint32_t max_token_length = 0; //词表中最长token字符串长度
 
-    std::array<unsigned char, 512> byte_pieces{}; //储存256个单字节字符串，每个字符串占2个字节，例如'A'后面接一个'\0'
+    std::array<unsigned char, 256> byte_pieces{}; //储存256个单字节字符串
 };
 
 void build_tokenizer(Tokenizer& tokenizer, const std::string& tokenizer_path, int vocab_size) 
@@ -241,6 +241,7 @@ struct Sampler //采样器，把模型输出的logits转换成下一个token
     float temperature; //改变logits分布的尖锐程度，logits除以temperature，temperature越小越尖锐保守，temperature越大越平坦随机
     float topp; //核采样参数
     unsigned long long rng_state; //随机数生成器的状态
+    std::mt19937 rng;
 
     Sampler()=default; //默认构造函数
     explicit Sampler(int vocab_size_,float temperature_,float topp_,unsigned long long rng_seed_) : vocab_size(vocab_size_),probindex(vocab_size_),temperature(temperature_),topp(topp_),rng_state(rng_seed_)//带参数的构造函数。explicit的作用是禁止隐式类型转换
@@ -282,7 +283,8 @@ void ensure_sorted_vocab(Tokenizer& tokenizer)
 }
 int str_lookup(const std::string& str,const Tokenizer& tokenizer) //二分查找str对应得token id
 {
-    auto it = std::lower_bound(tokenizer.sorted_vocab.begin(),tokenizer.sorted_vocab.end(),(TokenIndex){str,-1}); //TokenIndex默认比较字符串，赋值个-1没问题
+    auto key = TokenIndex{str, -1};
+    auto it = std::lower_bound(tokenizer.sorted_vocab.begin(),tokenizer.sorted_vocab.end(),key); //TokenIndex默认比较字符串，赋值个-1没问题
 
     if(it!=tokenizer.sorted_vocab.end()&&it->str==str) 
     {
@@ -688,7 +690,6 @@ int sample_topp(const float* probabilities,int n,float topp,std::vector<ProbInde
 
 int sample(Sampler& sampler,float* logits)
 {
-    static std::mt19937 rng(sampler.rng_state);
     static std::uniform_real_distribution<float> dist(0.0f, 1.0f);
 
     if(sampler.vocab_size<=0) 
@@ -714,7 +715,7 @@ int sample(Sampler& sampler,float* logits)
         softmax(logits,sampler.vocab_size); //从logits到probabilities
 
         
-        float coin=dist(rng); //随机数，用于从概率分布中抽样
+        float coin=dist(sampler.rng); //随机数，用于从概率分布中抽样
 
         if(sampler.topp<=0.0f||sampler.topp>=1.0f) //不启用top-p，直接从完整概率分布中采样
         {
@@ -925,7 +926,7 @@ bool read_checkpoint_header_and_map(Config &config,const std::string filename,fl
 
     std::cout<<"dim: "<<config.dim<<"\n"<<"vocab_size: "<<config.vocab_size<<"\n";
 
-    return 1;
+    return header[5]>0;
 }
 void build_transformer(Transformer& transformer, const std::string& checkpoint_path)
 {
