@@ -1,954 +1,165 @@
-#include<iostream>
-#include<vector>
-#include<sys/stat.h>
-#include<unistd.h>
-#include<sys/mman.h>
-#include<fcntl.h>
-#include<array>
-#include<fstream>
-#include<cstdint>
-#include<string>
-#include<algorithm>
-#include<cmath>
-#include<cstring>
-#include <random>
-#include <chrono>
+#include "zeroinfer/zeroinfer.h"
 
-struct Config //Llama2.c导出的二进制文件头部的28个字节是配置参数
+#include <cstdint>
+#include <cstdlib>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
+#include <string>
+
+namespace
 {
-    int dim; //Transformer dimension
-    int hidden_dim; //FFN层隐藏维度
-    int n_layers; //层数
-    int n_q_heads; //Query 头数
-    int n_kv_heads; //Key/Value 头数,GQA和上面头数不一样
-    int vocab_size; //词表大小
-    int seq_len; //最大序列长度
-};
-struct TransformerWeights //网络权重
+void print_usage(const char* program)
 {
-    float* token_embedding_table; //维度为(vocab_size,dim)，词嵌入表
-    float* rms_att_weight; //维度为(n_layers, dim)，attention子层前面的RMSNorm权重
-    float* rms_ffn_weight; //维度为(n_layers, dim)，FFN子层前面的RMSNorm权重
-    float* Wq; //维度为(n_layers, dim, dim( = n_q_heads * head_size))
-    float* Wk; //维度为(n_layers, dim, n_kv_heads * head_size)
-    float* Wv; //维度为(n_layers, dim, n_kv_heads * head_size)
-    float* Wo; //维度为(n_layers, dim, dim( = n_q_heads * head_size))
-    float* W1; //维度为(n_layers, hidden_dim , dim),SwiGLU上投影矩阵,把dim维投影到hidden_dim维
-    float* W2; //维度为(n_layers, dim , hidden_dim),SwiGLU下投影矩阵,把FFN中间维度投影回Transformer主干维度
-    float* W3; //维度为(n_layers, hidden_dim , dim),SwiGLU上投影矩阵,gate分支
-    float* rms_final_weight; //所有Transformer层结束后的最终RMSNorm权重
-    float* wcls; //最终分类器权重，把最终hidden state转成词表大小的logits
-};
-
-struct RunState
-{
-    // vector相比new[]可以自己释放，性能上也差不多
-    std::vector<float> x; //各个变量的解释见allocate和forward
-    std::vector<float> xb; 
-    std::vector<float> xb2; 
-    std::vector<float> hb; 
-    std::vector<float> hb2; 
-    std::vector<float> q; 
-    float* k = nullptr; //后面会指向cache
-    float* v = nullptr; //后面会指向cache
-    std::vector<float> key_cache; 
-    std::vector<float> value_cache; 
-    std::vector<float> att; 
-    std::vector<float> logits; 
-    
-
-    RunState()=default; //默认构造函数
-    explicit RunState(const Config &p){allocate(p);} //带参数的构造函数。explicit的作用是禁止隐式类型转换
-    
-    void allocate(const Config &p)
-    {
-        const int kv_dim = p.dim / p.n_q_heads * p.n_kv_heads ;
-
-        x.assign(static_cast<size_t>(p.dim), 0.0f); //这些维度详见forward
-        xb.assign(static_cast<size_t>(p.dim), 0.0f);
-        xb2.assign(static_cast<size_t>(p.dim), 0.0f);
-
-        hb.assign(static_cast<size_t>(p.hidden_dim), 0.0f);
-        hb2.assign(static_cast<size_t>(p.hidden_dim), 0.0f);
-
-        q.assign(static_cast<size_t>(p.dim), 0.0f); //query,dim=n_q_heads*head_size
-
-        key_cache.assign(static_cast<size_t>(p.n_layers) * p.seq_len * kv_dim, 0.0f); //每层每个位置缓存kv_dim维key
-        value_cache.assign(static_cast<size_t>(p.n_layers) * p.seq_len * kv_dim, 0.0f); //每层每个位置缓存kv_dim维value
-
-        att.assign(static_cast<size_t>(p.n_q_heads) * p.seq_len, 0.0f); //当前pos在当前q_head上对前面位置（最大为seq_len）的attention分数
-
-        logits.assign(p.vocab_size, 0.0f); //输出词表上每个token的未归一化分数
-    }
-};
-
-struct Transformer
-{
-    Config config{};
-    TransformerWeights weights{};
-    RunState state{};
-    int fd=-1; //checkpoint文件的文件描述符
-    float* data=nullptr; //指向checkpoint文件映射到内存的起点
-    ssize_t file_size=0; //checkpoint文件字节大小
-
-    ~Transformer() 
-    {
-        if (data != nullptr && data != MAP_FAILED) 
-        {
-            munmap(data, file_size);
-        }
-        if (fd != -1) 
-        {
-            close(fd);
-        }
-    }
-};
-
-void assign_weights(TransformerWeights &weights,float* weights_ptr,const Config &config,const bool shared_weights)
-{
-    const size_t n_layers = static_cast<size_t>(config.n_layers); //这样做是为了防止int会溢出
-    //赋值权重
-    weights.token_embedding_table = weights_ptr;
-    weights_ptr += config.vocab_size * config.dim;
-
-    weights.rms_att_weight = weights_ptr;
-    weights_ptr += n_layers * config.dim;
-
-    int head_size=config.dim / config.n_q_heads; //head_size为每个头的维度
-    weights.Wq = weights_ptr;
-    weights_ptr += n_layers * config.dim * config.dim;
-
-    weights.Wk = weights_ptr;
-    weights_ptr += n_layers * config.dim * (config.n_kv_heads * head_size);
-
-    weights.Wv = weights_ptr;
-    weights_ptr += n_layers * config.dim * (config.n_kv_heads * head_size);
-
-    weights.Wo = weights_ptr;
-    weights_ptr += n_layers * config.dim * config.dim;
-
-    weights.rms_ffn_weight = weights_ptr;
-    weights_ptr += n_layers * config.dim;
-
-    weights.W1 = weights_ptr;
-    weights_ptr += n_layers * config.hidden_dim * config.dim;
-
-    weights.W2 = weights_ptr;
-    weights_ptr += n_layers * config.dim * config.hidden_dim;
-
-    weights.W3 = weights_ptr;
-    weights_ptr += n_layers * config.hidden_dim * config.dim;
-
-    weights.rms_final_weight = weights_ptr;
-    weights_ptr += config.dim;
-    const size_t rope_table_size = static_cast<size_t>(config.seq_len) * head_size / 2;
-
-    // 跳过的是旧的ROPE用到的部分，这里用不到了
-    weights_ptr += rope_table_size;
-    weights_ptr += rope_table_size;
-
-    weights.wcls = shared_weights ? weights.token_embedding_table : weights_ptr; //用来把(dim,)转回(vocab_size,) 
-
+    std::cout
+        << "Usage: " << program << " [options]\n\n"
+        << "Options:\n"
+        << "  --model PATH          Model checkpoint (default: stories15M.bin)\n"
+        << "  --tokenizer PATH      Tokenizer file (default: tokenizer.bin)\n"
+        << "  --prompt TEXT         Prompt text (default: \"Long long ago\")\n"
+        << "  --steps N             Total forward steps; 0 uses model maximum (default: 0)\n"
+        << "  --temperature VALUE   Sampling temperature; 0 uses argmax (default: 0.95)\n"
+        << "  --top-p VALUE         Nucleus sampling threshold in [0, 1] (default: 0.9)\n"
+        << "  --threads N           OpenMP thread count; 0 uses runtime default (default: 0)\n"
+        << "  --seed N              Random seed (default: 233333)\n"
+        << "  -h, --help            Show this help message\n";
 }
 
-struct TokenIndex //用来根据字符串找到token id
+std::string require_value(int& index,int argc,char* argv[],const std::string& option)
 {
-    std::string str;
-    int id;
-    friend bool operator <(const TokenIndex& a, const TokenIndex& b) // 按照字典序排序
-    { 
-        return a.str < b.str;
-    }
-};
-
-struct Tokenizer 
-{
-    std::vector<std::string> vocab; //词表数组，根据token id找到字符串
-    std::vector<float> vocab_scores; //用于BPE合并
-    std::vector<TokenIndex> sorted_vocab; //按照字符串排序，encode阶段能快速根据字符串找到token id
-
-    int vocab_size = 0; //词表大小
-    std::uint32_t max_token_length = 0; //词表中最长token字符串长度
-
-    std::array<unsigned char, 256> byte_pieces{}; //储存256个单字节字符串
-};
-
-void build_tokenizer(Tokenizer& tokenizer, const std::string& tokenizer_path, int vocab_size) 
-{
-    //初始化
-    tokenizer.vocab.resize(vocab_size);
-    tokenizer.vocab_scores.resize(vocab_size);
-    tokenizer.sorted_vocab.clear();
-    tokenizer.vocab_size = vocab_size;
-
-    for(int i=0;i<256;i++) 
+    if(index+1>=argc)
     {
-        tokenizer.byte_pieces[i] = static_cast<unsigned char>(i);
+        throw std::invalid_argument("missing value for "+option);
     }
-
-    //读文件
-    std::ifstream file(tokenizer_path, std::ios::binary);
-    if(!file) 
-    {
-        throw std::runtime_error("couldn't load " + tokenizer_path);
-    }
-
-    auto read_exact = [&](char* dst, std::size_t size) //lambda表达式,这个&把外部变量按引用捕获进来了
-    {
-        if (!file.read(dst, static_cast<std::streamsize>(size))) //static_cast是显示普通类型转换
-        {
-            throw std::runtime_error("failed read");
-        }
-    };
-
-    std::int32_t max_len_from_file = 0;
-    read_exact(reinterpret_cast<char*>(&max_len_from_file), sizeof(std::int32_t)); //reinterpret_cast是底层内存重新解释的转换
-    tokenizer.max_token_length = static_cast<std::uint32_t>(max_len_from_file);
-
-    for (int i = 0; i < vocab_size; i++) 
-    {
-        read_exact(reinterpret_cast<char*>(&tokenizer.vocab_scores[i]), sizeof(float));
-
-        std::int32_t len = 0;
-        read_exact(reinterpret_cast<char*>(&len), sizeof(std::int32_t));
-
-        if (len < 0) 
-        {
-            throw std::runtime_error("invalid token length");
-        }
-
-        std::string token(len, '\0');
-        read_exact(&token[0], static_cast<std::size_t>(len));
-
-        tokenizer.vocab[i] = std::move(token); //通过move移动赋值，不写的话就是拷贝赋值
-    }
+    return argv[++index];
 }
 
-struct ProbIndex // top-p采样时用
+int parse_int(const std::string& value,const std::string& option)
 {
-    float prob; //token的概率
-    int index; //token的id
-    friend bool operator <(const ProbIndex &a,const ProbIndex &b)
+    std::size_t parsed=0;
+    long long result=0;
+    try
     {
-        return a.prob>b.prob;
+        result=std::stoll(value,&parsed);
     }
-}; 
-
-struct Sampler //采样器，把模型输出的logits转换成下一个token
-{
-    int vocab_size; //词表大小
-    std::vector<ProbIndex> probindex; //top-p采样时用的临时数组
-    float temperature; //改变logits分布的尖锐程度，logits除以temperature，temperature越小越尖锐保守，temperature越大越平坦随机
-    float topp; //核采样参数
-    unsigned long long rng_state; //随机数生成器的状态
-    std::mt19937 rng;
-
-    Sampler()=default; //默认构造函数
-    explicit Sampler(int vocab_size_,float temperature_,float topp_,unsigned long long rng_seed_) : vocab_size(vocab_size_),probindex(vocab_size_),temperature(temperature_),topp(topp_),rng_state(rng_seed_)//带参数的构造函数。explicit的作用是禁止隐式类型转换
+    catch(const std::exception&)
     {
-    } 
-};
-
-void matmul(float* xout,const float* x,const float* w,int n,int d) // 输出、输入、权重、输入维度、输出维度。W(d,n)矩阵乘法x(n,)得到的结果存到xout (d,)。
-{
-    #pragma omp parallel for //并行计算i
-    for(int i=0;i<d;++i) 
-    {
-        const float* row=w+i*n; //行号
-
-        float val=0.0f;
-        for (int j=0;j<n;++j) //j是串行计算的 
-        {
-            val+=row[j]*x[j];
-        }
-
-        xout[i]=val;
+        throw std::invalid_argument("invalid integer for "+option+": "+value);
     }
+
+    if(parsed!=value.size()||result<std::numeric_limits<int>::min()||result>std::numeric_limits<int>::max())
+    {
+        throw std::invalid_argument("invalid integer for "+option+": "+value);
+    }
+    return static_cast<int>(result);
 }
-void ensure_sorted_vocab(Tokenizer& tokenizer)
+
+std::uint64_t parse_seed(const std::string& value)
 {
-    if (!tokenizer.sorted_vocab.empty()) 
+    if(!value.empty()&&value.front()=='-')
     {
-        return;
+        throw std::invalid_argument("invalid integer for --seed: "+value);
     }
 
-    tokenizer.sorted_vocab.reserve(static_cast<size_t>(tokenizer.vocab_size));
-
-    for (int i=0;i<tokenizer.vocab_size;++i) 
+    std::size_t parsed=0;
+    unsigned long long result=0;
+    try
     {
-        tokenizer.sorted_vocab.push_back(TokenIndex{tokenizer.vocab[i],i});
+        result=std::stoull(value,&parsed);
+    }
+    catch(const std::exception&)
+    {
+        throw std::invalid_argument("invalid integer for --seed: "+value);
     }
 
-    std::sort(tokenizer.sorted_vocab.begin(),tokenizer.sorted_vocab.end());
+    if(parsed!=value.size())
+    {
+        throw std::invalid_argument("invalid integer for --seed: "+value);
+    }
+    return static_cast<std::uint64_t>(result);
 }
-int str_lookup(const std::string& str,const Tokenizer& tokenizer) //二分查找str对应得token id
+
+float parse_float(const std::string& value,const std::string& option)
 {
-    auto key = TokenIndex{str, -1};
-    auto it = std::lower_bound(tokenizer.sorted_vocab.begin(),tokenizer.sorted_vocab.end(),key); //TokenIndex默认比较字符串，赋值个-1没问题
-
-    if(it!=tokenizer.sorted_vocab.end()&&it->str==str) 
+    std::size_t parsed=0;
+    float result=0.0f;
+    try
     {
-        return it->id;
+        result=std::stof(value,&parsed);
+    }
+    catch(const std::exception&)
+    {
+        throw std::invalid_argument("invalid number for "+option+": "+value);
     }
 
-    return -1;
-} 
-std::vector<int> encode(Tokenizer& tokenizer,const std::string& text,bool bos,bool eos) //这里的bos和eos是是否加入开始/结束标记
+    if(parsed!=value.size())
+    {
+        throw std::invalid_argument("invalid number for "+option+": "+value);
+    }
+    return result;
+}
+}
+
+int main(int argc,char* argv[])
 {
-    ensure_sorted_vocab(tokenizer);
-
-    std::vector<int> tokens;
-    tokens.reserve(text.size()+3); //+3是BOS和EOS和dummy_prefix
-
-    if (bos) //可选添加BOS token，BOS=1
+    try
     {
-        tokens.push_back(1);
-    }
+        zeroinfer::InferenceOptions options;
 
-    if (!text.empty()) //SentencePiece风格的dummy prefix,非空文本前加一个空格 token 
-    {
-        int dummy_prefix=str_lookup(" ",tokenizer);
-        if(dummy_prefix==-1) 
+        for(int i=1;i<argc;++i)
         {
-            throw std::runtime_error("dummy prefix token ' ' not found in vocabulary");
-        }
+            const std::string argument=argv[i];
 
-        tokens.push_back(dummy_prefix);
-    }
-
-    //按UTF-8 codepoint初步编码。这是因为中文字符和表情等会占用多个字节，规律如下
-    /*
-        1字节字符: 0xxxxxxx
-        2字节字符: 110xxxxx 10xxxxxx
-        3字节字符: 1110xxxx 10xxxxxx 10xxxxxx
-        4字节字符: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
-    */
-    std::string str_buffer; //用来处理UTF-8
-    str_buffer.reserve(4); //UTF-8单个codepoint最多4字节
-
-    for(size_t pos=0;pos<text.size();++pos) 
-    {
-        unsigned char byte=text[pos];
-        
-        if((byte&0xC0)!=0x80) //如果当前字节不是UTF-8 continuation byte，则开始新的codepoint
-        {
-            str_buffer.clear();
-        }
-
-        str_buffer.push_back(static_cast<char>(byte));
-
-        bool next_is_continuation = false;
-        if(pos+1<text.size()) 
-        {
-            next_is_continuation=((text[pos+1]&0xC0)==0x80);
-        }
-
-        
-        if(next_is_continuation && str_buffer.size()<4) //如果下一个字节还是continuation byte，并且当前codepoint长度还没超过4，说明这个UTF-8 codepoint还没读完，继续累积
-        {
-            continue;
-        }
-        else //否则说明已经拿到一个完整codepoint，尝试在词表中查找
-        {
-            int id=str_lookup(str_buffer,tokenizer);
-
-            if(id!=-1) //找到了
+            if(argument=="-h"||argument=="--help")
             {
-                tokens.push_back(id);
-            } 
-            else //没找到，退化成按字节编码
-            {
-                
-                for (unsigned char b : str_buffer) 
-                {
-                    tokens.push_back(static_cast<int>(b) + 3); //每个原始字节映射到byte+3是因为前三个一般是<unk> BOS EOS
-                }
+                print_usage(argv[0]);
+                return EXIT_SUCCESS;
             }
-
-            str_buffer.clear();
-        }
-    }
-
-    
-    while (true) //BPE合并,每轮选择vocab_scores最高的可合并pair
-    {
-        float best_score=-1e10f;
-        int best_id=-1; //token id
-        int best_pos=-1; //在token序列中的位置
-
-        for(int i=0;i<static_cast<int>(tokens.size())-1;++i) 
-        {
-            const std::string& left=tokenizer.vocab[tokens[i]];
-            const std::string& right=tokenizer.vocab[tokens[i+1]];
-
-            std::string merged=left+right;
-
-            int id=str_lookup(merged,tokenizer);
-
-            if(id!=-1&&tokenizer.vocab_scores[id]>best_score) 
+            if(argument=="--model")
             {
-                best_score=tokenizer.vocab_scores[id];
-                best_id=id;
-                best_pos=i;
+                options.model_path=require_value(i,argc,argv,argument);
+            }
+            else if(argument=="--tokenizer")
+            {
+                options.tokenizer_path=require_value(i,argc,argv,argument);
+            }
+            else if(argument=="--prompt")
+            {
+                options.prompt=require_value(i,argc,argv,argument);
+            }
+            else if(argument=="--steps")
+            {
+                options.steps=parse_int(require_value(i,argc,argv,argument),argument);
+            }
+            else if(argument=="--temperature")
+            {
+                options.temperature=parse_float(require_value(i,argc,argv,argument),argument);
+            }
+            else if(argument=="--top-p")
+            {
+                options.top_p=parse_float(require_value(i,argc,argv,argument),argument);
+            }
+            else if(argument=="--threads")
+            {
+                options.threads=parse_int(require_value(i,argc,argv,argument),argument);
+            }
+            else if(argument=="--seed")
+            {
+                options.seed=parse_seed(require_value(i,argc,argv,argument));
+            }
+            else
+            {
+                throw std::invalid_argument("unknown option: "+argument);
             }
         }
 
-        if(best_pos==-1) //所有相邻pair的合并string都在词表中找不到
-        {
-            break;
-        }
-        
-        tokens[best_pos]=best_id; //把tokens[best_pos]和tokens[best_pos+1]合并成best_id
-        tokens.erase(tokens.begin()+best_pos+1);
+        zeroinfer::run(options);
+        return EXIT_SUCCESS;
     }
-
-    
-    if(eos) //可选添加EOS token，EOS=2
+    catch(const std::exception& error)
     {
-        tokens.push_back(2);
+        std::cerr<<"error: "<<error.what()<<"\n";
+        std::cerr<<"Try --help for usage.\n";
+        return EXIT_FAILURE;
     }
-
-    return tokens;
-}
-void rmsnorm(float* out,const float* x,const float* weight,int size)
-{
-    float ss=0.0f;
-
-    for(int j=0;j<size;++j) 
-    {
-        ss+=x[j]*x[j];
-    }
-
-    ss/=static_cast<float>(size);
-    ss+=1e-5f;
-    ss=1.0f/std::sqrt(ss);
-
-    for(int j=0;j<size;++j) 
-    {
-        out[j]=weight[j]*(ss*x[j]);
-    }
-}
-
-void softmax(float* x,int size)
-{
-    float max_val=x[0];
-
-    for(int i=1;i<size;++i) 
-    {
-        if(x[i]>max_val) 
-        {
-            max_val=x[i];
-        }
-    }
-
-    float sum=0.0f;
-
-    for(int i=0;i<size;++i) 
-    {
-        x[i]=std::exp(x[i]-max_val);
-        sum+=x[i];
-    }
-
-    for(int i=0;i<size;++i) 
-    {
-        x[i]/=sum;
-    }
-}
-float* forward(Transformer& transformer,int token,int pos)
-{
-    Config& p=transformer.config;
-    TransformerWeights& w=transformer.weights;
-    RunState& s=transformer.state;
-
-    const int dim=p.dim;
-    const int hidden_dim=p.hidden_dim;
-    const int head_size=dim/p.n_q_heads; //一个头的qkv有多少维度
-    const int kv_dim=p.n_kv_heads*head_size; //k和v总共的维度
-    const int kv_mul=p.n_q_heads/p.n_kv_heads; //一个q配多少个kv
-
-    if(token<0||token>=p.vocab_size) 
-    {
-        throw std::runtime_error("token id out of range");
-    }
-
-    if(pos<0||pos>=p.seq_len) 
-    {
-        throw std::runtime_error("position out of range");
-    }
-
-    float* x=s.x.data();
-
-    const float* content_row=w.token_embedding_table+static_cast<size_t>(token)*dim; //找到这个token在词表中对应的向量
-    std::memcpy(x,content_row,static_cast<size_t>(dim)*sizeof(float));
-
-    for(int l=0;l<p.n_layers;++l) //forward所有的layers
-    {
-
-        //Attention部分
-
-        //xb=RMSNorm(x)
-        rmsnorm(s.xb.data(),x,w.rms_att_weight+l*dim,dim);
-        
-        const size_t layer_offset=l*static_cast<size_t>(p.seq_len)*kv_dim; //当前层在KV cache中的偏移
-
-        float* key=s.key_cache.data()     + layer_offset + static_cast<size_t>(pos) * kv_dim; //当前token的key/value写入KV cache的位置
-        float* value=s.value_cache.data() + layer_offset + static_cast<size_t>(pos) * kv_dim;
-
-        
-        matmul(s.q.data(),s.xb.data(),w.Wq+l*static_cast<size_t>(dim)*dim,dim,dim); //q = Wq @ xb
-        matmul(key,s.xb.data(),w.Wk+l*static_cast<size_t>(dim)*kv_dim,dim,kv_dim); //key = Wk @ xb
-        matmul(value,s.xb.data(),w.Wv+l*static_cast<size_t>(dim)*kv_dim,dim,kv_dim); //value = Wv @ xb
-
-        for(int i=0;i<dim;i+=2) //RoPE
-        {
-            int head_dim=i%head_size; //多头注意力分别处理
-            float freq=1.0f/std::pow(10000.0f,head_dim/static_cast<float>(head_size)); //TODO:可不可以提前算出来存着？
-
-            float val=pos * freq;
-            float fcr=std::cos(val);
-            float fci=std::sin(val);
-
-            //kv_dim小于q_dim,所以i<kv_dim时q和k都旋转；否则只旋转q
-            int rotn=(i<kv_dim)?2:1;
-
-            for (int v_idx=0;v_idx<rotn;++v_idx) 
-            {
-                float* vec=(v_idx==0)?s.q.data():key; //v_idx为0的时候旋转q，为1的时候旋转k
-
-                float v0=vec[i];
-                float v1=vec[i + 1];
-
-                vec[i]     = v0 * fcr - v1 * fci; //旋转
-                vec[i + 1] = v0 * fci + v1 * fcr;
-            }
-        }
-
-        
-        #pragma omp parallel for
-        for(int h=0;h<p.n_q_heads;++h) //多头注意力,多个头配一个kv
-        {
-            float* q=s.q.data()+static_cast<size_t>(h)*head_size;
-            float* att=s.att.data()+static_cast<size_t>(h)*p.seq_len;
-
-            for(int t=0;t<=pos;++t) //计算当前head对0..pos的attention scores 
-            {
-                const float* k = s.key_cache.data() + layer_offset + static_cast<size_t>(t) * kv_dim + static_cast<size_t>(h / kv_mul) * head_size;
-
-                float score=0.0f;
-
-                for(int i=0;i<head_size;++i) 
-                {
-                    score+=q[i]*k[i];
-                }
-
-                score/=std::sqrt(static_cast<float>(head_size));
-                att[t]=score;
-            }
-
-            softmax(att,pos+1); //计算softmax
-
-            float* xb=s.xb.data()+static_cast<size_t>(h)*head_size; //加权求和value，结果写入xb对应head的位置
-
-            std::memset(xb,0,static_cast<size_t>(head_size)*sizeof(float));
-
-            for(int t=0;t<=pos;++t) 
-            {
-                const float* v = s.value_cache.data() + layer_offset + static_cast<size_t>(t) * kv_dim + static_cast<size_t>(h / kv_mul) * head_size;
-
-                float a=att[t];
-
-                for(int i=0;i<head_size;++i) 
-                {
-                    xb[i]+=a*v[i];
-                }
-            }
-        }
-
-        
-        matmul(s.xb2.data(),s.xb.data(),w.Wo+ l * static_cast<size_t>(dim) * dim,dim,dim); //xb2 = Wo @ xb
-
-        
-        for(int i=0;i<dim;++i) //x = x + xb2
-        {
-            x[i]+=s.xb2[i];
-        }
-
-
-        //FFN 部分
-
-        rmsnorm(s.xb.data(),x,w.rms_ffn_weight + l * dim,dim); //xb=RMSNorm(x)
-
-        matmul(s.hb.data(),s.xb.data(),w.W1 + l * static_cast<size_t>(dim) * hidden_dim,dim,hidden_dim); //hb = W1 @ xb
-        matmul(s.hb2.data(),s.xb.data(),w.W3 + l * static_cast<size_t>(dim) * hidden_dim,dim,hidden_dim); //hb2 = W3 @ xb
-
-        
-        for(int i=0;i<hidden_dim;++i) //hb = SiLU(hb) * hb2
-        {
-            float val=s.hb[i];
-            
-            val *= 1.0f / (1.0f + std::exp(-val)); //SiLU(x)=x*sigmoid(x)
-            val *= s.hb2[i]; //SwiGLU gate
-
-            s.hb[i]=val;
-        }
-
-        
-        matmul(s.xb.data(),s.hb.data(),w.W2 + l * static_cast<size_t>(dim) * hidden_dim,hidden_dim,dim); //xb = W2 @ hb
-
-        for(int i=0;i<dim;++i) //x = x + xb
-        {
-            x[i]+=s.xb[i];
-        }
-    }
-
-    rmsnorm(x,x,w.rms_final_weight,dim); //final RMSNorm，此时维度为(dim,)
-
-    matmul(s.logits.data(),x,w.wcls,dim,p.vocab_size); //logits = wcls @ x
-
-    return s.logits.data();
-}
-
-int sample_argmax(const float* probabilities,int n)
-{
-    int max_i=0;
-    float max_p=probabilities[0];
-
-    for(int i=1;i<n;++i) 
-    {
-        if(probabilities[i]>max_p) 
-        {
-            max_i=i;
-            max_p=probabilities[i];
-        }
-    }
-
-    return max_i;
-}
-
-int sample_mult(const float* probabilities,int n,float coin)
-{
-    float cdf=0.0f;
-
-    for(int i=0;i<n;++i) 
-    {
-        cdf+=probabilities[i];
-
-        if(coin<cdf) //cdf超过coin就采样
-        {
-            return i;
-        }
-    }
-
-    return n-1; //兜底
-}
-
-int sample_topp(const float* probabilities,int n,float topp,std::vector<ProbIndex>& probindex,float coin)
-{
-    probindex.clear();
-
-    const float cutoff=(1.0f-topp)/static_cast<float>(n-1); //没选上的部分(最多n-1个)的概率和不超过1-topp，概率值比cutoff小的不可能成为结果
-
-    for(int i=0;i<n;++i) 
-    {
-        if(probabilities[i]>=cutoff) //筛掉概率值比cutoff小的
-        {
-            probindex.push_back(ProbIndex{probabilities[i],i});
-        }
-    }
-
-    std::sort(probindex.begin(),probindex.end());
-
-    float cumulative_prob=0.0f;
-    int last_idx=static_cast<int>(probindex.size())-1;
-
-    for(int i=0;i<static_cast<int>(probindex.size());++i) 
-    {
-        cumulative_prob+=probindex[i].prob;
-
-        if(cumulative_prob>topp) //先筛选出概率和超过topp的部分
-        {
-            last_idx=i;
-            break;
-        }
-    }
-
-    float r=coin*cumulative_prob;
-    float cdf=0.0f;
-
-    for(int i=0;i<=last_idx;++i) 
-    {
-        cdf+=probindex[i].prob;
-
-        if(r<cdf) //cdf超过coin*cumulative_prob就采样
-        {
-            return probindex[i].index;
-        }
-    }
-
-    return probindex[last_idx].index; //兜底
-}
-
-int sample(Sampler& sampler,float* logits)
-{
-    static std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-
-    if(sampler.vocab_size<=0) 
-    {
-        throw std::runtime_error("invalid sampler.vocab_size");
-    }
-
-    int next=0;
-
-    if(sampler.temperature == 0.0f) //直接取最大logits的token
-    {
-        next=sample_argmax(logits,sampler.vocab_size);
-    } 
-    else 
-    {
-        
-        for(int q=0;q<sampler.vocab_size;++q) //temperature scaling
-        {
-            logits[q]/=sampler.temperature;
-        }
-
-        
-        softmax(logits,sampler.vocab_size); //从logits到probabilities
-
-        
-        float coin=dist(sampler.rng); //随机数，用于从概率分布中抽样
-
-        if(sampler.topp<=0.0f||sampler.topp>=1.0f) //不启用top-p，直接从完整概率分布中采样
-        {
-            next=sample_mult(logits,sampler.vocab_size,coin);
-        } 
-        else //启用top-p采样
-        {
-            next=sample_topp(logits,sampler.vocab_size,sampler.topp,sampler.probindex,coin);
-        }
-    }
-
-    return next;
-}
-int hex_value(char c) //十六进制转十进制
-{
-    if('0'<=c&&c<='9') 
-    {
-        return c-'0';
-    }
-
-    if('a'<=c&&c<='f') 
-    {
-        return c - 'a' + 10;
-    }
-
-    if('A'<=c&&c<='F') 
-    {
-        return c-'A'+10;
-    }
-
-    return -1;
-}
-
-bool parse_byte_token(std::string_view piece,unsigned char& byte_val)
-{
-    if(piece.size()!=6) //形如"<0xAB>"，算上尖括号，长度为 6
-    {
-        return false;
-    }
-
-    if(piece[0]!='<'||piece[1]!='0'||piece[2]!='x'||piece[5]!='>') 
-    {
-        return false;
-    }
-
-    int hi=hex_value(piece[3]);
-    int lo=hex_value(piece[4]);
-
-    if(hi==-1||lo==-1) 
-    {
-        return false;
-    }
-
-    byte_val = static_cast<unsigned char>((hi<<4)|lo); //<<4就是乘以16
-    return true;
-}
-std::string_view decode(Tokenizer& tokenizer,int prev_token,int token)
-{
-    if(token<0||token>=tokenizer.vocab_size) 
-    {
-        throw std::runtime_error("decode: token id out of range");
-    }
-
-    std::string_view piece=tokenizer.vocab[token];
-
-    if(prev_token==1&&!piece.empty()&&piece.front()==' ') //如果当前piece紧跟BOS，并且开头是空格，则去掉这个空格
-    {
-        piece.remove_prefix(1);
-    }
-
-    //encode的时候会有词表中找不到，然后按照字节编码的情况。decode的时候要考虑这种。
-    unsigned char byte_val = 0;
-    if(parse_byte_token(piece,byte_val)) 
-    {
-        const char* byte_piece=reinterpret_cast<const char*>(tokenizer.byte_pieces.data() + static_cast<size_t>(byte_val));
-        
-        return std::string_view(byte_piece,1); //返回长度为1的string_view
-    }
-
-    return piece;
-}
-
-void safe_printf(std::string_view piece)
-{
-    if(piece.empty()) 
-    {
-        return;
-    }
-
-    if(piece.size()==1) 
-    {
-        unsigned char byte_val=static_cast<unsigned char>(piece[0]);
-
-        if((!std::isprint(byte_val)) && (!std::isspace(byte_val))) //检查是否可打印/是否是空白字符
-        {
-            return;
-        }
-    }
-
-    std::cout.write(piece.data(),static_cast<std::streamsize>(piece.size()));
-}
-
-long time_in_ms()
-{
-    using namespace std::chrono;
-
-    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
-}
-
-void generate(Transformer &transformer,Tokenizer &tokenizer,Sampler &sampler,const std::string &prompt,int steps)
-{
-    std::vector<int>prompt_tokens=encode(tokenizer,prompt,true,false); //把prompt编码成token序列
-
-    for(auto token : prompt_tokens)
-    {
-        printf("token : %d\n",token);
-    }
-
-    if (prompt_tokens.empty()) 
-    {
-        throw std::runtime_error("expected at least one prompt token");
-    }
-
-
-    long start=0; //开始时间
-    int next=0; //下一个token
-    int token=prompt_tokens[0]; //当前token
-    int pos=0;
-
-    
-    while(pos<steps) //自回归生成循环
-    {
-        //当前token进入Transformer，得到下一token的logits
-        float* logits=forward(transformer,token,pos);
-
-        if(pos<static_cast<int>(prompt_tokens.size())-1) //已有的部分也要forward，处理KV cache
-        {
-            next=prompt_tokens[pos + 1];
-        } 
-        else 
-        {
-            next=sample(sampler, logits); //从logits里采样
-        }
-
-        ++pos;
-
-        
-        if(next==2 || next==1) //使用EOS token=2作为终止条件
-        {
-            break;
-        }
-
-        std::string_view piece=decode(tokenizer,token,next); //解码并打印当前生成出来的 token
-        safe_printf(piece);
-        std::fflush(stdout);
-
-        token=next; //自回归，这一步生成的token成为下一步输入
-
-        //第一轮开始计时
-        if(start==0) 
-        {
-            start=time_in_ms();
-        }
-    }
-
-    std::printf("\n");
-
-    
-    if(pos>1&&start!=0) //输出 tok/s
-    {
-        long end=time_in_ms();
-        double tok_per_sec=(pos-1)/static_cast<double>(end-start)*1000.0;
-        std::fprintf(stderr,"achieved tok/s: %f\n", tok_per_sec);
-    }
-}
-
-bool read_checkpoint_header_and_map(Config &config,const std::string filename,float* &data,int &fd,ssize_t &file_size)
-{
-    struct stat sb; //用于描述文件的元数据
-    if(stat(filename.c_str(),&sb)==-1) //返回0表示正确填充，-1出错
-    {
-        throw std::runtime_error("Failed to stat file\n"); 
-    }
-
-    fd=open(filename.c_str(),O_RDONLY); //O_RDONLY只读，O_WRONLY只写，O_RDWR可读可写
-    if(fd==-1)
-    {
-        throw std::runtime_error("Failed to open file\n"); 
-    }
-
-    //mmap零CPU拷贝,访问数据时才由DMA把磁盘页加载到页缓存
-    file_size=sb.st_size;
-    data=(float*)mmap(NULL,file_size,PROT_READ,MAP_PRIVATE,fd,0); //各个参数分别是：期望映射到的虚拟地址、映射长度、内存访问权限（可读/可写/可执行）、映射类型标志（私有映射，修改不会同步回磁盘原文件）、文件描述符、文件内偏移量，成功返回映射区起始虚拟地址指针，失败返回-1
-    if(data==MAP_FAILED)
-    {
-        throw std::runtime_error("mmap failed\n"); 
-    }
-
-
-    int* header=(int*)data;
-    config.dim = header[0];
-    config.hidden_dim = header[1];
-    config.n_layers = header[2];
-    config.n_q_heads = header[3];
-    config.n_kv_heads = header[4];
-    config.vocab_size = header[5];
-    config.seq_len = header[6];
-
-    std::cout<<"dim: "<<config.dim<<"\n"<<"vocab_size: "<<config.vocab_size<<"\n";
-
-    return header[5]>0;
-}
-void build_transformer(Transformer& transformer, const std::string& checkpoint_path)
-{
-    bool shared_weights = read_checkpoint_header_and_map(transformer.config,checkpoint_path,transformer.data,transformer.fd,transformer.file_size);
-
-    transformer.state.allocate(transformer.config);
-
-    float* weights_ptr = transformer.data + sizeof(Config) / sizeof(float);
-
-    assign_weights(transformer.weights,weights_ptr,transformer.config,shared_weights); //赋值模型权重
-}
-int main()
-{
-    Transformer transformer;
-    build_transformer(transformer,"stories15M.bin");
-
-    Tokenizer tokenizer;
-    build_tokenizer(tokenizer,"tokenizer.bin",transformer.config.vocab_size);
-    
-    Sampler sampler(transformer.config.vocab_size,0.95,0.9,233333);
-
-    generate(transformer,tokenizer,sampler,"Long long ago",transformer.config.seq_len);
-
-    return 0;
 }
