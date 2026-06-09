@@ -99,6 +99,18 @@ cmake --build build -j
 - `zeroinfer`：静态推理库
 - `llama_infer`：命令行程序
 
+## 测试
+
+项目使用 CTest 运行内部算子单元测试：
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+当前测试覆盖非方阵 matmul、RMSNorm 参考值与原地计算，以及 softmax
+参考值和大 logits 下的数值稳定性。配置 CMake 时传入
+`-DBUILD_TESTING=OFF` 可以关闭测试目标。
+
 ## 运行
 
 ```bash
