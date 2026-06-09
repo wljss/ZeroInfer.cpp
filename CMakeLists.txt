@@ -5,6 +5,7 @@ project(ZeroInfer LANGUAGES CXX)
 find_package(OpenMP REQUIRED)
 
 add_library(zeroinfer STATIC
+    src/internal/ops.cpp
     src/zeroinfer.cpp
 )
 
@@ -12,6 +13,8 @@ target_compile_features(zeroinfer PUBLIC cxx_std_17)
 target_include_directories(zeroinfer
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(zeroinfer PUBLIC OpenMP::OpenMP_CXX)
 

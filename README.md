@@ -11,12 +11,75 @@ ZeroInfer.cpp 是一个使用 C++17 编写的轻量级 Llama 2 CPU 推理引擎�
 - OpenMP 并行矩阵向量乘法
 - CMake 静态库与命令行程序
 
+## 模型结构
+
+![](./Overview.png)
+
+模型采用 decoder-only Transformer，自回归地根据已有 token 预测下一个 token。输入文本首先经过 Tokenizer 转换为 token id，再通过词嵌入表得到隐藏状态：
+
+$$
+x_0 = E[t]
+$$
+
+其中 $E$ 是词嵌入矩阵，$t$ 是当前 token id。隐藏状态依次通过若干Transformer 层，每层由带残差连接的注意力子层和前馈网络子层组成：
+
+$$
+x' = x + \operatorname{Attention}(\operatorname{RMSNorm}(x))
+$$
+
+$$
+x_{\text{next}} =
+x' + \operatorname{FFN}(\operatorname{RMSNorm}(x'))
+$$
+
+RMSNorm 根据向量的均方根进行归一化，并乘以可学习权重：
+
+$$
+\operatorname{RMSNorm}(x)_i =
+w_i\frac{x_i}{\sqrt{\frac{1}{d}\sum_{j=1}^{d}x_j^2+\epsilon}}
+$$
+
+注意力子层首先将隐藏状态投影为 Query、Key 和 Value：
+
+$$
+Q=W_Qx,\qquad K=W_Kx,\qquad V=W_Vx
+$$
+
+RoPE 将位置信息编码到 Query 和 Key 中。随后使用缩放点积注意力计算当前
+token 对历史 token 的权重：
+
+$$
+\operatorname{Attention}(Q,K,V)=
+\operatorname{softmax}\left(\frac{QK^\mathsf{T}}{\sqrt{d_h}}\right)V
+$$
+
+其中 $d_h$ 是单个注意力头的维度。推理时历史 Key 和 Value 存入 KV cache，生成下一个 token 时无需重复计算。模型支持 GQA，即多个 Query 头可以共享一组 Key/Value 头。
+
+前馈网络使用 SwiGLU：
+
+$$
+\operatorname{FFN}(x)=
+W_2\left(\operatorname{SiLU}(W_1x)\odot(W_3x)\right)
+$$
+
+经过所有 Transformer 层后，模型执行最终 RMSNorm，并通过分类矩阵得到
+词表上的 logits：
+
+$$
+\text{logits}=W_{\text{cls}}\operatorname{RMSNorm}(x)
+$$
+
+logits 经过 temperature 和 softmax 转换为概率分布，再使用贪心或 top-p
+采样得到下一个 token。该 token 会继续进入模型，形成自回归生成循环。
+
 ## 项目结构
 
 ```text
 .
 ├── CMakeLists.txt
 ├── include/zeroinfer/zeroinfer.h  # 核心库公开接口
+├── src/internal/ops.h              # 可独立测试的内部算子接口
+├── src/internal/ops.cpp            # matmul、RMSNorm 和 softmax
 ├── src/zeroinfer.cpp              # 推理引擎实现
 ├── main.cpp                       # CLI 参数解析和程序入口
 └── tokenizer.bin                  # Tokenizer 数据

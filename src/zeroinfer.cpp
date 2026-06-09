@@ -1,5 +1,7 @@
 #include "zeroinfer/zeroinfer.h"
 
+#include "internal/ops.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -264,22 +266,6 @@ struct Sampler //采样器，把模型输出的logits转换成下一个token
     } 
 };
 
-void matmul(float* xout,const float* x,const float* w,int in_features,int out_features) // 输出、输入、权重、输入维度、输出维度。W(d,n)矩阵乘法x(n,)得到的结果存到xout (d,)。
-{
-    #pragma omp parallel for //并行计算i
-    for(int i=0;i<out_features;++i) 
-    {
-        const float* row=w+i*in_features; //行号
-
-        float val=0.0f;
-        for (int j=0;j<in_features;++j) //j是串行计算的 
-        {
-            val+=row[j]*x[j];
-        }
-
-        xout[i]=val;
-    }
-}
 void ensure_sorted_vocab(Tokenizer& tokenizer)
 {
     if (!tokenizer.sorted_vocab.empty()) 
@@ -425,50 +411,6 @@ std::vector<int> encode(Tokenizer& tokenizer,const std::string& text,bool bos,bo
 
     return tokens;
 }
-void rmsnorm(float* out,const float* x,const float* weight,int size)
-{
-    float ss=0.0f;
-
-    for(int j=0;j<size;++j) 
-    {
-        ss+=x[j]*x[j];
-    }
-
-    ss/=static_cast<float>(size);
-    ss+=1e-5f;
-    ss=1.0f/std::sqrt(ss);
-
-    for(int j=0;j<size;++j) 
-    {
-        out[j]=weight[j]*(ss*x[j]);
-    }
-}
-
-void softmax(float* x,int size)
-{
-    float max_val=x[0];
-
-    for(int i=1;i<size;++i) 
-    {
-        if(x[i]>max_val) 
-        {
-            max_val=x[i];
-        }
-    }
-
-    float sum=0.0f;
-
-    for(int i=0;i<size;++i) 
-    {
-        x[i]=std::exp(x[i]-max_val);
-        sum+=x[i];
-    }
-
-    for(int i=0;i<size;++i) 
-    {
-        x[i]/=sum;
-    }
-}
 float* forward(Transformer& transformer,int token,int pos)
 {
     Config& p=transformer.config;
@@ -502,7 +444,7 @@ float* forward(Transformer& transformer,int token,int pos)
         //Attention部分
 
         //xb=RMSNorm(x)
-        rmsnorm(s.xb.data(),x,w.rms_att_weight+l*dim,dim);
+        zeroinfer::internal::rmsnorm(s.xb.data(),x,w.rms_att_weight+l*dim,dim);
         
         const size_t layer_offset=l*static_cast<size_t>(p.seq_len)*kv_dim; //当前层在KV cache中的偏移
 
@@ -510,9 +452,9 @@ float* forward(Transformer& transformer,int token,int pos)
         float* value=s.value_cache.data() + layer_offset + static_cast<size_t>(pos) * kv_dim;
 
         
-        matmul(s.q.data(),s.xb.data(),w.Wq+l*static_cast<size_t>(dim)*dim,dim,dim); //q = Wq @ xb
-        matmul(key,s.xb.data(),w.Wk+l*static_cast<size_t>(dim)*kv_dim,dim,kv_dim); //key = Wk @ xb
-        matmul(value,s.xb.data(),w.Wv+l*static_cast<size_t>(dim)*kv_dim,dim,kv_dim); //value = Wv @ xb
+        zeroinfer::internal::matmul(s.q.data(),s.xb.data(),w.Wq+l*static_cast<size_t>(dim)*dim,dim,dim); //q = Wq @ xb
+        zeroinfer::internal::matmul(key,s.xb.data(),w.Wk+l*static_cast<size_t>(dim)*kv_dim,dim,kv_dim); //key = Wk @ xb
+        zeroinfer::internal::matmul(value,s.xb.data(),w.Wv+l*static_cast<size_t>(dim)*kv_dim,dim,kv_dim); //value = Wv @ xb
 
         for(int i=0;i<dim;i+=2) //RoPE
         {
@@ -560,7 +502,7 @@ float* forward(Transformer& transformer,int token,int pos)
                 att[t]=score;
             }
 
-            softmax(att,pos+1); //计算softmax
+            zeroinfer::internal::softmax(att,pos+1); //计算softmax
 
             float* xb=s.xb.data()+static_cast<size_t>(h)*head_size; //加权求和value，结果写入xb对应head的位置
 
@@ -580,7 +522,7 @@ float* forward(Transformer& transformer,int token,int pos)
         }
 
         
-        matmul(s.xb2.data(),s.xb.data(),w.Wo+ l * static_cast<size_t>(dim) * dim,dim,dim); //xb2 = Wo @ xb
+        zeroinfer::internal::matmul(s.xb2.data(),s.xb.data(),w.Wo+ l * static_cast<size_t>(dim) * dim,dim,dim); //xb2 = Wo @ xb
 
         
         for(int i=0;i<dim;++i) //x = x + xb2
@@ -591,10 +533,10 @@ float* forward(Transformer& transformer,int token,int pos)
 
         //FFN 部分
 
-        rmsnorm(s.xb.data(),x,w.rms_ffn_weight + l * dim,dim); //xb=RMSNorm(x)
+        zeroinfer::internal::rmsnorm(s.xb.data(),x,w.rms_ffn_weight + l * dim,dim); //xb=RMSNorm(x)
 
-        matmul(s.hb.data(),s.xb.data(),w.W1 + l * static_cast<size_t>(dim) * hidden_dim,dim,hidden_dim); //hb = W1 @ xb
-        matmul(s.hb2.data(),s.xb.data(),w.W3 + l * static_cast<size_t>(dim) * hidden_dim,dim,hidden_dim); //hb2 = W3 @ xb
+        zeroinfer::internal::matmul(s.hb.data(),s.xb.data(),w.W1 + l * static_cast<size_t>(dim) * hidden_dim,dim,hidden_dim); //hb = W1 @ xb
+        zeroinfer::internal::matmul(s.hb2.data(),s.xb.data(),w.W3 + l * static_cast<size_t>(dim) * hidden_dim,dim,hidden_dim); //hb2 = W3 @ xb
 
         
         for(int i=0;i<hidden_dim;++i) //hb = SiLU(hb) * hb2
@@ -608,7 +550,7 @@ float* forward(Transformer& transformer,int token,int pos)
         }
 
         
-        matmul(s.xb.data(),s.hb.data(),w.W2 + l * static_cast<size_t>(dim) * hidden_dim,hidden_dim,dim); //xb = W2 @ hb
+        zeroinfer::internal::matmul(s.xb.data(),s.hb.data(),w.W2 + l * static_cast<size_t>(dim) * hidden_dim,hidden_dim,dim); //xb = W2 @ hb
 
         for(int i=0;i<dim;++i) //x = x + xb
         {
@@ -616,9 +558,9 @@ float* forward(Transformer& transformer,int token,int pos)
         }
     }
 
-    rmsnorm(x,x,w.rms_final_weight,dim); //final RMSNorm，此时维度为(dim,)
+    zeroinfer::internal::rmsnorm(x,x,w.rms_final_weight,dim); //final RMSNorm，此时维度为(dim,)
 
-    matmul(s.logits.data(),x,w.wcls,dim,p.vocab_size); //logits = wcls @ x
+    zeroinfer::internal::matmul(s.logits.data(),x,w.wcls,dim,p.vocab_size); //logits = wcls @ x
 
     return s.logits.data();
 }
@@ -727,7 +669,7 @@ int sample(Sampler& sampler,float* logits)
         }
 
         
-        softmax(logits,sampler.vocab_size); //从logits到probabilities
+        zeroinfer::internal::softmax(logits,sampler.vocab_size); //从logits到probabilities
 
         
         float coin=dist(sampler.rng); //随机数，用于从概率分布中抽样
