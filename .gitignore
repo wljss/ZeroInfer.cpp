@@ -4,3 +4,6 @@ stories42M.bin
 stories110M.bin
 .vscode
 build
+build-pytorch
+__pycache__/
+*.py[cod]

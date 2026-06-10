@@ -111,6 +111,42 @@ ctest --test-dir build --output-on-failure
 参考值和大 logits 下的数值稳定性。配置 CMake 时传入
 `-DBUILD_TESTING=OFF` 可以关闭测试目标。
 
+### PyTorch 数值对齐
+
+项目提供可选的 PyTorch 对齐测试。Python 负责生成固定的 float32 输入，
+C++ runner 执行项目中的真实算子，最后由 PyTorch 计算参考结果并报告
+最大绝对误差和平均绝对误差。该流程覆盖多个形状的 matmul、RMSNorm 和
+softmax，其中包括接近模型实际维度的 `768 x 288` 矩阵向量乘法。
+
+推荐使用已验证的 `tmp3.12` conda 环境：
+
+```bash
+conda activate tmp3.12
+
+cmake -S . -B build-pytorch \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DZEROINFER_ENABLE_PYTORCH_ALIGNMENT=ON \
+  -DPython3_EXECUTABLE="$CONDA_PREFIX/bin/python"
+
+cmake --build build-pytorch -j
+ctest --test-dir build-pytorch -R pytorch --output-on-failure
+```
+
+PyTorch 对齐默认关闭，因此普通 C++ 单元测试不会依赖 Python、NumPy 或
+PyTorch。
+
+在 Python 3.12.13、PyTorch 2.10.0 和 NumPy 2.2.6 的 CPU 环境中，当前
+固定测试数据的对齐结果如下：
+
+| 算子 | 测试用例数 | 最大绝对误差 |
+| --- | ---: | ---: |
+| matmul | 3 | `3.34e-6` |
+| RMSNorm | 3 | `7.15e-7` |
+| softmax | 3 | `1.79e-7` |
+
+全部 9 个对齐用例均通过。不同 CPU、编译器和 PyTorch 版本可能因
+float32 归约顺序不同而产生轻微误差变化。
+
 ## 运行
 
 ```bash
